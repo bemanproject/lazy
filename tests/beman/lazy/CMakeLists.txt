@@ -3,6 +3,8 @@
 list(
     APPEND
     lazy_tests
+    handle
+    final_awaiter
     allocator_of
     allocator_support
     any_scheduler

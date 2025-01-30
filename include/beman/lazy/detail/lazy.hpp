@@ -11,6 +11,8 @@
 #include <beman/lazy/detail/scheduler_of.hpp>
 #include <beman/lazy/detail/stop_source.hpp>
 #include <beman/lazy/detail/inline_scheduler.hpp>
+#include <beman/lazy/detail/final_awaiter.hpp>
+#include <beman/lazy/detail/handle.hpp>
 #include <concepts>
 #include <coroutine>
 #include <optional>
@@ -122,21 +124,20 @@ struct lazy {
 
     struct promise_type : lazy_promise_base<std::remove_cvref_t<T>>,
                           ::beman::lazy::detail::allocator_support<allocator_type> {
+        void complete() { this->state->complete(this->result); }
+        void start(auto&& env, state_base* s) {
+            this->scheduler.emplace(::beman::execution::get_scheduler(env));
+            this->state = s;
+            std::coroutine_handle<promise_type>::from_promise(*this).resume();
+        }
 
         template <typename... A>
         promise_type(const A&... a) : allocator(::beman::lazy::detail::find_allocator<allocator_type>(a...)) {}
 
-        struct final_awaiter {
-            promise_type*         promise;
-            static constexpr bool await_ready() noexcept { return false; }
-            void        await_suspend(std::coroutine_handle<>) noexcept { promise->state->complete(promise->result); }
-            static void await_resume() noexcept {}
-        };
-
         std::suspend_always initial_suspend() noexcept { return {}; }
-        final_awaiter       final_suspend() noexcept { return {this}; }
+        final_awaiter       final_suspend() noexcept { return {}; }
         void unhandled_exception() { this->result.template emplace<std::exception_ptr>(std::current_exception()); }
-        lazy get_return_object() { return {std::coroutine_handle<promise_type>::from_promise(*this)}; }
+        auto get_return_object() { return lazy(::beman::lazy::detail::handle<promise_type>(this)); }
 
         template <typename E>
         auto await_transform(with_error<E> with) noexcept {
@@ -156,7 +157,7 @@ struct lazy {
         template <typename E>
         final_awaiter yield_value(with_error<E> with) noexcept {
             this->result.template emplace<E>(with.error);
-            return {this};
+            return {};
         }
 
         [[no_unique_address]] allocator_type allocator;
@@ -232,41 +233,32 @@ struct lazy {
         using stop_callback_t = ::beman::execution::stop_callback_for_t<stop_token_t, stop_link>;
         template <typename R, typename H>
         state(R&& r, H h) : state_rep<Receiver>(std::forward<R>(r)), handle(std::move(h)) {}
-        ~state() {
-            if (this->handle) {
-                this->handle.destroy();
-            }
-        }
-        std::coroutine_handle<promise_type> handle;
+
+        ::beman::lazy::detail::handle<promise_type> handle;
         stop_source_type                    source;
         std::optional<stop_callback_t>      stop_callback;
 
-        void start() & noexcept {
-            handle.promise().scheduler.emplace(
-                ::beman::execution::get_scheduler(::beman::execution::get_env(this->receiver)));
-            handle.promise().state = this;
-            handle.resume();
-        }
+        void start() & noexcept { this->handle.start(::beman::execution::get_env(this->receiver), this); }
         void complete(typename lazy_promise_base<std::remove_cvref_t<T>>::result_t& result) override {
             switch (result.index()) {
             case 0: // set_stopped
-                this->reset_handle();
+                this->handle.reset();
                 ::beman::execution::set_stopped(std::move(this->receiver));
                 break;
             case 1: // set_value
                 if constexpr (std::same_as<void, T>) {
-                    reset_handle();
+                    handle.reset();
                     ::beman::execution::set_value(std::move(this->receiver));
                 } else {
                     auto r(std::move(std::get<1>(result)));
-                    this->reset_handle();
+                    this->handle.reset();
                     ::beman::execution::set_value(std::move(this->receiver), std::move(r));
                 }
                 break;
             default:
                 sub_visit<2>(
                     [this](auto&& r) {
-                        this->reset_handle();
+                        this->handle.reset();
                         ::beman::execution::set_error(std::move(this->receiver), std::move(r));
                     },
                     result);
@@ -281,32 +273,18 @@ struct lazy {
             }
             return this->source.get_token();
         }
-        C&   get_context() override { return this->context; }
-        void reset_handle() {
-            this->handle.destroy();
-            this->handle = {};
-        }
+        C& get_context() override { return this->context; }
     };
 
-    std::coroutine_handle<promise_type> handle;
+    ::beman::lazy::detail::handle<promise_type> handle;
 
   private:
-    lazy(std::coroutine_handle<promise_type> h) : handle(std::move(h)) {}
+    explicit lazy(::beman::lazy::detail::handle<promise_type> h) : handle(std::move(h)) {}
 
   public:
-    lazy(const lazy& other) = delete;
-    lazy(lazy&& other) : handle(std::exchange(other.handle, {})) {}
-    ~lazy() {
-        if (this->handle) {
-            this->handle.destroy();
-        }
-    }
-    lazy& operator=(const lazy&) = delete;
-    lazy& operator=(lazy&&)      = delete;
-
     template <typename Receiver>
     state<Receiver> connect(Receiver receiver) {
-        return state<Receiver>(std::forward<Receiver>(receiver), std::exchange(this->handle, {}));
+        return state<Receiver>(std::forward<Receiver>(receiver), std::move(this->handle));
     }
 };
 } // namespace beman::lazy::detail
